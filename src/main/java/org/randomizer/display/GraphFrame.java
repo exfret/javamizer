@@ -3,6 +3,7 @@ package org.randomizer.display;
 import org.jgrapht.graph.DirectedPseudograph;
 
 import javax.swing.*;
+import javax.swing.Timer;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.geom.*;
@@ -17,10 +18,15 @@ import java.util.function.Function;
  *   - parallel edges (drawn as separate curved "lanes" between the same pair)
  *   - self-loops (drawn as loops above the node, nested if there are several)
  *
+ * Interaction:
+ *   - middle-click drag a node : springy ("boingy") drag — the node chases the
+ *     cursor on an underdamped spring and wobbles into place on release
+ *   - left-click drag a node   : rigid drag (node pinned to cursor)
+ *   - drag empty background    : pan the view
+ *   - scroll wheel             : zoom, centered on the cursor
+ *
  * Usage:
  *   GraphFrame.show(graph, Node::getName, Route::getName);
- *
- * Nodes are draggable with the mouse.
  */
 public class GraphFrame {
 
@@ -55,8 +61,18 @@ public class GraphFrame {
 
     static class GraphPanel<V, E> extends JPanel {
 
-        private static final int NODE_R = 28;          // node circle radius
+        private static final int NODE_R = 28;          // node circle radius (world units)
         private static final double LANE_GAP = 26;     // separation between parallel edges
+
+        // spring physics (underdamped on purpose — that's the boing)
+        private static final double DT        = 1.0 / 60.0;
+        private static final double STIFFNESS = 170.0; // spring constant k
+        private static final double DAMPING   = 7.0;   // velocity damping c
+        private static final double SETTLE_DIST  = 0.4;
+        private static final double SETTLE_SPEED = 2.0;
+
+        private static final double MIN_ZOOM = 0.15, MAX_ZOOM = 6.0;
+
         private static final Color NODE_FILL   = new Color(0x2D6A9F);
         private static final Color NODE_BORDER = new Color(0x1B4266);
         private static final Color EDGE_COLOR  = new Color(0x555555);
@@ -66,9 +82,22 @@ public class GraphFrame {
         private final Function<V, String> vertexName;
         private final Function<E, String> edgeName;
 
+        // world-space node state
         private final Map<V, Point2D.Double> pos = new IdentityHashMap<>();
-        private V dragged = null;
+        private final Map<V, Point2D.Double> vel = new IdentityHashMap<>();
+        private final Map<V, Point2D.Double> springTarget = new IdentityHashMap<>();
+
+        // view transform: screen = world * scale + offset
+        private double scale = 1.0, offX = 0, offY = 0;
+
+        // interaction state
+        private V rigidDragged = null;   // left-button drag
+        private V springDragged = null;  // middle-button drag
+        private Point panStart = null;   // screen coords of a background drag
+        private double panOffX0, panOffY0;
+
         private boolean laidOut = false;
+        private final Timer physics;
 
         GraphPanel(DirectedPseudograph<V, E> graph,
                    Function<V, String> vertexName,
@@ -78,29 +107,117 @@ public class GraphFrame {
             this.edgeName = edgeName;
             setBackground(Color.WHITE);
 
+            physics = new Timer((int) (DT * 1000), ev -> stepPhysics());
+            physics.setCoalesce(true);
+
             MouseAdapter mouse = new MouseAdapter() {
                 @Override public void mousePressed(MouseEvent e) {
-                    dragged = nodeAt(e.getX(), e.getY());
+                    Point2D.Double w = toWorld(e.getX(), e.getY());
+                    V hit = nodeAt(w.x, w.y);
+                    if (hit != null && SwingUtilities.isMiddleMouseButton(e)) {
+                        springDragged = hit;
+                        vel.computeIfAbsent(hit, k -> new Point2D.Double());
+                        springTarget.put(hit, new Point2D.Double(w.x, w.y));
+                        physics.start();
+                    } else if (hit != null && SwingUtilities.isLeftMouseButton(e)) {
+                        rigidDragged = hit;
+                        springTarget.remove(hit);   // rigid drag overrides any leftover spring
+                        vel.remove(hit);
+                    } else {
+                        panStart = e.getPoint();
+                        panOffX0 = offX;
+                        panOffY0 = offY;
+                    }
                 }
+
                 @Override public void mouseReleased(MouseEvent e) {
-                    dragged = null;
+                    // spring target stays where the cursor let go, so the node
+                    // wobbles into place; the physics loop clears it once settled
+                    springDragged = null;
+                    rigidDragged = null;
+                    panStart = null;
                 }
+
                 @Override public void mouseDragged(MouseEvent e) {
-                    if (dragged != null) {
-                        pos.get(dragged).setLocation(e.getX(), e.getY());
+                    if (springDragged != null) {
+                        Point2D.Double w = toWorld(e.getX(), e.getY());
+                        springTarget.get(springDragged).setLocation(w.x, w.y);
+                    } else if (rigidDragged != null) {
+                        Point2D.Double w = toWorld(e.getX(), e.getY());
+                        pos.get(rigidDragged).setLocation(w.x, w.y);
+                        repaint();
+                    } else if (panStart != null) {
+                        offX = panOffX0 + (e.getX() - panStart.x);
+                        offY = panOffY0 + (e.getY() - panStart.y);
                         repaint();
                     }
+                }
+
+                @Override public void mouseWheelMoved(MouseWheelEvent e) {
+                    double factor = Math.pow(1.1, -e.getPreciseWheelRotation());
+                    double newScale = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, scale * factor));
+                    factor = newScale / scale;
+                    // zoom about the cursor: keep the world point under the mouse fixed
+                    offX = e.getX() - (e.getX() - offX) * factor;
+                    offY = e.getY() - (e.getY() - offY) * factor;
+                    scale = newScale;
+                    repaint();
                 }
             };
             addMouseListener(mouse);
             addMouseMotionListener(mouse);
+            addMouseWheelListener(mouse);
         }
 
-        private V nodeAt(int x, int y) {
+        private Point2D.Double toWorld(double sx, double sy) {
+            return new Point2D.Double((sx - offX) / scale, (sy - offY) / scale);
+        }
+
+        private V nodeAt(double wx, double wy) {
             for (Map.Entry<V, Point2D.Double> en : pos.entrySet()) {
-                if (en.getValue().distance(x, y) <= NODE_R) return en.getKey();
+                if (en.getValue().distance(wx, wy) <= NODE_R) return en.getKey();
             }
             return null;
+        }
+
+        // ---------------- physics ----------------
+
+        /**
+         * Semi-implicit Euler on a spring-damper per active node:
+         *   a = k * (target - p) - c * v
+         * Underdamped (c &lt; 2*sqrt(k)) so nodes overshoot and boing.
+         */
+        private void stepPhysics() {
+            boolean anyActive = false;
+            Iterator<Map.Entry<V, Point2D.Double>> it = springTarget.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<V, Point2D.Double> en = it.next();
+                V v = en.getKey();
+                Point2D.Double p = pos.get(v);
+                Point2D.Double target = en.getValue();
+                Point2D.Double velo = vel.computeIfAbsent(v, k -> new Point2D.Double());
+                if (p == null) { it.remove(); continue; }
+
+                double ax = STIFFNESS * (target.x - p.x) - DAMPING * velo.x;
+                double ay = STIFFNESS * (target.y - p.y) - DAMPING * velo.y;
+                velo.x += ax * DT;
+                velo.y += ay * DT;
+                p.x += velo.x * DT;
+                p.y += velo.y * DT;
+
+                boolean settled = p.distance(target) < SETTLE_DIST
+                        && Math.hypot(velo.x, velo.y) < SETTLE_SPEED
+                        && v != springDragged;    // never settle while held
+                if (settled) {
+                    p.setLocation(target);
+                    vel.remove(v);
+                    it.remove();
+                } else {
+                    anyActive = true;
+                }
+            }
+            if (!anyActive) physics.stop();
+            repaint();
         }
 
         /** Place vertices evenly on a circle. */
@@ -124,15 +241,19 @@ public class GraphFrame {
                 layoutCircle();
                 laidOut = true;
             }
-            Graphics2D g = (Graphics2D) g0;
+            Graphics2D g = (Graphics2D) g0.create();
             g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                     RenderingHints.VALUE_ANTIALIAS_ON);
             g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
                     RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
             g.setFont(getFont().deriveFont(Font.PLAIN, 12f));
 
+            g.translate(offX, offY);
+            g.scale(scale, scale);
+
             drawEdges(g);
             drawNodes(g);
+            g.dispose();
         }
 
         // ---------------- edges ----------------
@@ -308,43 +429,5 @@ public class GraphFrame {
                         (float) (p.y + fm.getAscent() / 2.0) - 1);
             }
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Demo main — delete freely. Assumes Node/Route-style classes exist;
-    // shown here inline so the file compiles standalone.
-    // ------------------------------------------------------------------
-
-    static class DemoNode {
-        private final String name;
-        DemoNode(String name) { this.name = name; }
-        public String getName() { return name; }
-    }
-
-    static class DemoEdge {
-        private final String name;
-        DemoEdge(String name) { this.name = name; }
-        public String getName() { return name; }
-    }
-
-    public static void main(String[] args) {
-        DirectedPseudograph<DemoNode, DemoEdge> g =
-                new DirectedPseudograph<>(DemoEdge.class);
-
-        DemoNode tampa = new DemoNode("Tampa");
-        DemoNode atlanta = new DemoNode("Atlanta");
-        DemoNode miami = new DemoNode("Miami");
-        g.addVertex(tampa);
-        g.addVertex(atlanta);
-        g.addVertex(miami);
-
-        g.addEdge(tampa, atlanta, new DemoEdge("Delta $129"));
-        g.addEdge(tampa, atlanta, new DemoEdge("SW $99"));      // parallel
-        g.addEdge(atlanta, tampa, new DemoEdge("Delta $140"));  // reverse direction
-        g.addEdge(atlanta, miami, new DemoEdge("AA $180"));
-        g.addEdge(tampa, tampa, new DemoEdge("loop A"));        // self-loop
-        g.addEdge(tampa, tampa, new DemoEdge("loop B"));        // nested self-loop
-
-        show(g);   // reflection overload; or: show(g, DemoNode::getName, DemoEdge::getName)
     }
 }
